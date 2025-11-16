@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Network Chart</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Rubik:wght@400;700&display=swap');
+    
+    :root {
+      --text-black: #020202;
+      --near-black: #383838;
+      --bg-white: #d3d3d3;
+      --panel-grey: #C2C2C2;
+      --main-yellow: #FFD241;
+      --shadow-grey: #9E9E9E;
+      --light-yellow: #FFEDB4;
+      --shadow-yellow: #DEB555;
+      --light-grey:  #d8d8d8;
+      --highlight-white: #FFFFFF;
+      --error-red: #dc2626;
+      --font-family: 'Rubik', Arial, Helvetica, sans-serif;
+    }
+    
+    html,body { 
+      height:100%; 
+      margin:0; 
+      font-family: var(--font-family); 
+      background:var(--bg-white); 
+      overflow: hidden;
+    }
+    #wrap { display:flex; height:100vh; overflow:hidden; }
+
+    /* MAIN CONTENT AREA */
+    #main-content {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      background: var(--bg-white);
+      position: relative;
+      overflow: hidden;
+    }
+
+    /* CANVAS */
+    #canvas {
+      flex: 1;
+      position: relative;
+      overflow: hidden;
+      cursor: grab;
+    }
+
+    #canvas.panning {
+      cursor: grabbing;
+    }
+
+    svg {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+
+    .node {
+      cursor: pointer;
+    }
+
+    .node circle {
+      stroke: var(--text-black);
+      stroke-width: 2px;
+    }
+
+    .node.selected circle {
+      stroke: var(--main-yellow);
+      stroke-width: 4px;
+      filter: drop-shadow(0 0 8px var(--main-yellow));
+    }
+
+    .node.search-highlight circle {
+      stroke: var(--main-yellow);
+      stroke-width: 4px;
+      animation: pulseGlow 1.5s ease-in-out infinite;
+    }
+
+    .node text {
+      font-family: var(--font-family);
+      font-size: 12px;
+      font-weight: 700;
+      fill: var(--text-black);
+      pointer-events: none;
+      user-select: none;
+      text-anchor: middle;
+      dominant-baseline: central;
+    }
+
+    .link {
+      stroke: var(--near-black);
+      stroke-width: 1.5px;
+      stroke-opacity: 0.6;
+      fill: none;
+    }
+
+    @keyframes pulseGlow {
+      0%, 100% { 
+        filter: drop-shadow(0 0 8px var(--main-yellow));
+      }
+      50% { 
+        filter: drop-shadow(0 0 16px var(--main-yellow));
+      }
+    }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <div id="main-content">
+      <div id="canvas"></div>
+    </div>
+  </div>
+
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <script>
+  /************************************************************************
+   * GLOBAL STATE
+   ************************************************************************/
+  let nodes = [];
+  let links = [];
+  let adjacency = new Map();
+  let nameIndex = new Set();
+  let nodeById = new Map();
+  let simulation = null;
+  let svg, g, linkLayer, nodeLayer;
+  let selectedNode = null;
+
+  const CONFIG = {
+    nodeRadius: 20,
+    linkDistance: 150,
+    chargeStrength: -400,
+    collisionRadius: 40,
+    maxSuggestions: 8,
+    minZoom: 0.1,
+    maxZoom: 5,
+  };
+
+  const canvasDiv = document.getElementById('canvas');
+  const transform = d3.zoomIdentity;
+
+  /************************************************************************
+   * URL PARAMETER PARSING
+   ************************************************************************/
+  function parseURLParams() {
+    const params = new URLSearchParams(window.location.search);
+    const dataKey = params.get('dataKey');
+    const dataParam = params.get('data');
+    
+    let chartData = null;
+    
+    // Try localStorage first (for large data)
+    if (dataKey) {
+      const stored = localStorage.getItem(dataKey);
+      if (stored) {
+        try {
+          chartData = JSON.parse(stored);
+          // Clean up after reading
+          localStorage.removeItem(dataKey);
+        } catch (e) {
+          console.error('Failed to parse localStorage data:', e);
+        }
+      }
+    }
+    
+    // Fallback to URL parameter
+    if (!chartData && dataParam) {
+      try {
+        const decoded = atob(dataParam);
+        chartData = JSON.parse(decoded);
+      } catch (e) {
+        console.error('Failed to parse URL data:', e);
+      }
+    }
+    
+    if (!chartData) {
+      console.error('No chart data found');
+      return null;
+    }
+    
+    // Parse viewport settings
+    const x = parseFloat(params.get('x')) || 0;
+    const y = parseFloat(params.get('y')) || 0;
+    const zoom = parseFloat(params.get('zoom')) || 1;
+    
+    return { chartData, x, y, zoom };
+  }
+
+  /************************************************************************
+   * INITIALIZATION
+   ************************************************************************/
+  function initializeChart() {
+    const urlData = parseURLParams();
+    if (!urlData) return;
+    
+    const { chartData, x, y, zoom } = urlData;
+    
+    // Load the data
+    nodes = chartData.nodes || [];
+    links = chartData.links || [];
+    
+    // Build indices
+    rebuildIndices();
+    
+    // Initialize D3
+    initD3();
+    
+    // Apply viewport settings
+    const initialTransform = d3.zoomIdentity
+      .translate(x, y)
+      .scale(zoom);
+    
+    svg.call(d3.zoom().transform, initialTransform);
+    
+    // Start simulation
+    startSimulation();
+    
+    // Initial render
+    render();
+  }
+
+  function rebuildIndices() {
+    adjacency.clear();
+    nameIndex.clear();
+    nodeById.clear();
+    
+    nodes.forEach(n => {
+      if (!n.id) n.id = n.name;
+      nodeById.set(n.id, n);
+      nameIndex.add(n.name);
+      adjacency.set(n.id, new Set());
+    });
+    
+    links.forEach(l => {
+      const src = nodeById.get(l.source);
+      const tgt = nodeById.get(l.target);
+      if (src && tgt) {
+        adjacency.get(src.id).add(tgt.name);
+        adjacency.get(tgt.id).add(src.name);
+      }
+    });
+  }
+
+  /************************************************************************
+   * D3 INITIALIZATION
+   ************************************************************************/
+  function initD3() {
+    svg = d3.select('#canvas').append('svg');
+    g = svg.append('g');
+    linkLayer = g.append('g').attr('class', 'links');
+    nodeLayer = g.append('g').attr('class', 'nodes');
+
+    const zoom = d3.zoom()
+      .scaleExtent([CONFIG.minZoom, CONFIG.maxZoom])
+      .on('zoom', (event) => {
+        g.attr('transform', event.transform);
+      });
+    
+    svg.call(zoom);
+    
+    // Prevent default drag behavior on canvas
+    canvasDiv.addEventListener('mousedown', (e) => {
+      if (e.target === canvasDiv || e.target.tagName === 'svg') {
+        canvasDiv.classList.add('panning');
+      }
+    });
+    
+    canvasDiv.addEventListener('mouseup', () => {
+      canvasDiv.classList.remove('panning');
+    });
+    
+    canvasDiv.addEventListener('mouseleave', () => {
+      canvasDiv.classList.remove('panning');
+    });
+  }
+
+  /************************************************************************
+   * FORCE SIMULATION
+   ************************************************************************/
+  function startSimulation() {
+    if (simulation) simulation.stop();
+    
+    simulation = d3.forceSimulation(nodes)
+      .force('link', d3.forceLink(links)
+        .id(d => d.id)
+        .distance(CONFIG.linkDistance))
+      .force('charge', d3.forceManyBody()
+        .strength(CONFIG.chargeStrength))
+      .force('center', d3.forceCenter(0, 0))
+      .force('collision', d3.forceCollide()
+        .radius(CONFIG.collisionRadius))
+      .on('tick', render);
+  }
+
+  /************************************************************************
+   * RENDERING
+   ************************************************************************/
+  function render() {
+    // Render links
+    const linkSelection = linkLayer.selectAll('path')
+      .data(links, d => `${d.source.id}-${d.target.id}`);
+    
+    linkSelection.exit().remove();
+    
+    const linkEnter = linkSelection.enter()
+      .append('path')
+      .attr('class', 'link');
+    
+    linkSelection.merge(linkEnter)
+      .attr('d', d => {
+        const sx = d.source.x || 0;
+        const sy = d.source.y || 0;
+        const tx = d.target.x || 0;
+        const ty = d.target.y || 0;
+        return `M${sx},${sy} L${tx},${ty}`;
+      })
+      .attr('stroke', d => d.color || 'var(--near-black)')
+      .attr('stroke-width', d => d.width || 1.5);
+    
+    // Render nodes
+    const nodeSelection = nodeLayer.selectAll('g.node')
+      .data(nodes, d => d.id);
+    
+    nodeSelection.exit().remove();
+    
+    const nodeEnter = nodeSelection.enter()
+      .append('g')
+      .attr('class', 'node');
+    
+    nodeEnter.append('circle');
+    nodeEnter.append('text');
+    
+    const nodeUpdate = nodeSelection.merge(nodeEnter);
+    
+    nodeUpdate.attr('transform', d => `translate(${d.x || 0},${d.y || 0})`);
+    
+    nodeUpdate.select('circle')
+      .attr('r', d => d.size || CONFIG.nodeRadius)
+      .attr('fill', d => d.color || '#FFEDB4');
+    
+    nodeUpdate.select('text')
+      .text(d => d.name)
+      .attr('dy', d => (d.size || CONFIG.nodeRadius) + 16)
+      .style('font-size', d => d.labelSize ? `${d.labelSize}px` : '12px')
+      .style('fill', d => d.labelColor || 'var(--text-black)');
+    
+    nodeUpdate.classed('selected', d => d === selectedNode);
+  }
+
+  /************************************************************************
+   * INITIALIZE ON LOAD
+   ************************************************************************/
+  window.addEventListener('load', initializeChart);
+  </script>
+</body>
+</html>
